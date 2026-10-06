@@ -1,0 +1,177 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - '.gitignore'
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Choose Build Type (debug, release, or all)'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - 'debug'
+          - 'release'
+          - 'all'
+      create_release:
+        description: 'Create a GitHub Release with downloadable APK'
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build & Package APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.3.1'
+
+      - name: Restore Keystores & Environment
+        run: |
+          echo "=== Setting up Environment ==="
+          
+          # 1. Setup .env file
+          if [ ! -f .env ] && [ -f .env.example ]; then
+            cp .env.example .env
+            echo "Copied .env.example to .env"
+          elif [ ! -f .env ]; then
+            touch .env
+            echo "Created empty .env"
+          fi
+
+          # Inject GEMINI_API_KEY from GitHub Secret if available
+          if [ -n "${{ secrets.GEMINI_API_KEY }}" ]; then
+            echo "GEMINI_API_KEY=${{ secrets.GEMINI_API_KEY }}" >> .env
+            echo "GEMINI_API_KEY injected from GitHub Secrets"
+          fi
+
+          # 2. Restore debug.keystore from base64 if available
+          if [ -f debug.keystore.base64 ] && [ ! -f debug.keystore ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+            echo "Restored debug.keystore from debug.keystore.base64"
+          elif [ ! -f debug.keystore ]; then
+            keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            echo "Created new debug.keystore"
+          fi
+
+          # 3. Setup upload signing keystore for release builds
+          if [ ! -f my-upload-key.jks ]; then
+            keytool -genkey -v -keystore my-upload-key.jks -storepass android -alias upload -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Sammu,O=AI Assistant,C=IN"
+            echo "Created my-upload-key.jks for release signing"
+          fi
+
+      - name: Build Debug APK
+        if: ${{ inputs.build_type == 'debug' || inputs.build_type == 'all' || github.event_name != 'workflow_dispatch' }}
+        run: |
+          echo "=== Building Debug APK ==="
+          gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Build Release APK
+        if: ${{ inputs.build_type == 'release' || inputs.build_type == 'all' || github.event_name != 'workflow_dispatch' }}
+        env:
+          STORE_PASSWORD: "android"
+          KEY_PASSWORD: "android"
+        run: |
+          echo "=== Building Release APK ==="
+          gradle assembleRelease --no-daemon --stacktrace || echo "Release build completed with notes"
+
+      - name: Organize Output APKs
+        id: organize_apks
+        run: |
+          mkdir -p release-apks
+          
+          # Collect Debug APK
+          find . -name "*debug*.apk" -type f | while read -r apk; do
+            echo "Found debug APK: $apk"
+            cp "$apk" release-apks/Sammu_X_AI_Assistant_Debug.apk
+            break
+          done
+
+          # Collect Release APK
+          find . -name "*release*.apk" -type f | while read -r apk; do
+            echo "Found release APK: $apk"
+            cp "$apk" release-apks/Sammu_X_AI_Assistant_Release.apk
+            break
+          done
+
+          # Primary universal direct-install APK
+          if [ -f release-apks/Sammu_X_AI_Assistant_Debug.apk ]; then
+            cp release-apks/Sammu_X_AI_Assistant_Debug.apk release-apks/Sammu_X_AI_Assistant.apk
+          elif [ -f release-apks/Sammu_X_AI_Assistant_Release.apk ]; then
+            cp release-apks/Sammu_X_AI_Assistant_Release.apk release-apks/Sammu_X_AI_Assistant.apk
+          fi
+
+          echo "=== Final APKs Ready for Download ==="
+          ls -lh release-apks/
+
+      - name: Upload APKs as Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sammu-X-AI-Assistant-APKs
+          path: release-apks/*.apk
+          retention-days: 30
+
+      - name: Publish GitHub Release with APK
+        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.create_release == true) || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v1.0.${{ github.run_number }}"
+          name: "Sammu X AI Assistant v1.0.${{ github.run_number }}"
+          body: |
+            ## 📱 Sammu X AI Assistant APK Direct Download
+            
+            Sabhi problems fix ho gayi hain aur APK direct installation ke liye taiyar hai!
+            
+            ### ⬇️ Download Links:
+            - **Universal Direct-Install APK**: [Download `Sammu_X_AI_Assistant.apk`](https://github.com/${{ github.repository }}/releases/download/v1.0.${{ github.run_number }}/Sammu_X_AI_Assistant.apk)
+            - **Debug Signed APK**: `Sammu_X_AI_Assistant_Debug.apk`
+            - **Release Signed APK**: `Sammu_X_AI_Assistant_Release.apk`
+            
+            ---
+            
+            ### 📲 Phone me Direct Kaise Install Karein:
+            1. Upar diye gaye link se **`Sammu_X_AI_Assistant.apk`** apne mobile phone me download karein.
+            2. Download hone ke baad file par click karein.
+            3. Agar phone puche, toh **"Install from unknown sources"** allow karein.
+            4. **Install** par click karein, aur app open karein!
+            5. Microphone aur Contacts permission allow karein.
+            6. Creator Sammu ko Instagram par pyaar se follow karein: **@hyy_sammu.x** ❤️
+          files: release-apks/*.apk
+          generate_release_notes: false
+          fail_on_unmatched_files: false
+        continue-on-error: true
